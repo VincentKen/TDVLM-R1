@@ -16,3 +16,4 @@ pip install matplotlib
 pip install pycocotools
 pip install openai
 pip install httpx[socks]
+pip install json-repair
