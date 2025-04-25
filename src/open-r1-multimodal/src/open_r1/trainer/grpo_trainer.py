@@ -288,6 +288,7 @@ class VLMGRPOTrainer(Trainer):
         #     if p.requires_grad:
         #         print(n, p.shape)
         print(f"Total trainable parameters: {total_params}")
+        assert total_params > 0, "No trainable parameters found. Please check the model and the PEFT configuration."
 
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
