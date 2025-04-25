@@ -6,9 +6,6 @@ export DEBUG_MODE="true"
 RUN_NAME="Qwen2.5-VL-7B-GRPO-REC-lora-own-dataset"
 export LOG_PATH="./debug_log_$RUN_NAME.txt"
 
-# --dataset_name data_config/rec.yaml \
-# --image_root /home/e12229949/VLM-R1/ \
-
 torchrun --nproc_per_node="2" \
     --nnodes="1" \
     --node_rank="0" \
@@ -23,7 +20,7 @@ torchrun --nproc_per_node="2" \
     --image_folders /home/e12229949/VLM-R1/dataset_small \
     --max_prompt_length 1024 \
     --num_generations 2 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 2 \
     --logging_steps 1 \
     --bf16 \
