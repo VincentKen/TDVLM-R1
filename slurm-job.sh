@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=GPU-a100
 #SBATCH --nodes=1
-#SBATCH --time=02:00:00
+#SBATCH --time=48:00:00
 #SBATCH --gres=gpu:a100:2
 
 cd /home/e12229949/TDVLM-R1
