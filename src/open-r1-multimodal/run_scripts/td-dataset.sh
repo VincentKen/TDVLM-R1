@@ -16,6 +16,7 @@ torchrun --nproc_per_node="2" \
     --output_dir output/$RUN_NAME \
     --model_name_or_path Qwen/Qwen2.5-VL-7B-Instruct \
     --dataset_name "TD-Dataset" \
+    --reward_method "all_match" \
     --data_file_path /home/e12229949/TDVLM-R1/dataset_2500/dataset.jsonl \
     --image_folders /home/e12229949/TDVLM-R1/dataset_2500 \
     --max_prompt_length 1024 \
@@ -29,7 +30,7 @@ torchrun --nproc_per_node="2" \
     --report_to wandb \
     --gradient_checkpointing true \
     --attn_implementation flash_attention_2 \
-    --num_train_epochs 1 \
+    --num_train_epochs 3 \
     --run_name $RUN_NAME \
     --save_steps 100 \
     --save_only_model false \
