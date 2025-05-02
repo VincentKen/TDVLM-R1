@@ -267,11 +267,20 @@ class VLMGRPOTrainer(Trainer):
                         continue
                     if isinstance(module, cls):
                         lora_module_names.add(name)
-                for m in lora_module_names:  # needed for 16-bit
-                    if "embed_tokens" in m:
-                        lora_module_names.remove(m)
+                #for m in lora_module_names:  # needed for 16-bit
+                #    if "embed_tokens" in m or "lm_head" in m:
+                #        lora_module_names.remove(m)
+                lora_module_names = {
+                    name for name in lora_module_names
+                    if "embed_tokens" not in name and "lm_head" not in name
+                    and isinstance(module, torch.nn.Linear)
+                    and any(kw in name for kw in ["q_proj", "k_proj", "v_proj", "o_proj", "vision", "cross_attention", "cross_attn"])
+                }
                 return list(lora_module_names)
             target_modules = find_all_linear_names(model, self.vision_modules_keywords)
+            print("LoRA will be applied to the following modules:")
+            for name in target_modules:
+                print("  -", name)
             peft_config.target_modules = target_modules
             model = get_peft_model(model, peft_config)
 
@@ -862,3 +871,4 @@ class VLMGRPOTrainer(Trainer):
             mini_repeat_count=self.num_generations,
             seed=self.args.seed,
         )
+
