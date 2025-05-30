@@ -321,7 +321,11 @@ class VLMGRPOTrainer(Trainer):
         # Processing class
         if processing_class is None:
             processing_cls = self.vlm_module.get_processing_class()
-            processing_class = processing_cls.from_pretrained(model_id, trust_remote_code=model_init_kwargs.get("trust_remote_code", None))
+            try:
+                processing_class = processing_cls.from_pretrained(model_id, trust_remote_code=model_init_kwargs.get("trust_remote_code", None))
+            except Exception as e:
+                if "preprocessor_config.json" in str(e):
+                    processing_class = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", trust_remote_code=model_init_kwargs.get("trust_remote_code", None))
             for component, processing_keyword in self.vlm_module.get_custom_processing_keywords():
                 if processing_keyword in kwargs:
                     # If we cannot find component in processing_class, return the processing_class itself

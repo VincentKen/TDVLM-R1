@@ -40,6 +40,8 @@ from typing import Tuple
 from transformers.utils import logging
 from transformers import AutoProcessor, AutoTokenizer
 
+import warnings
+
 from openai import OpenAI
 
 logger = logging.get_logger(__name__)
@@ -823,6 +825,31 @@ def default_accuracy_reward(content, sol, **kwargs):
 
     return reward
 
+def ratio_reward(content, sol, **kwargs):
+    """
+    Calculate the reward based on the similarity ratio between content and solution.
+    
+    Args:
+        content (str): The generated content from the model.
+        sol (str): The ground truth solution.
+        
+    Returns:
+        float: Similarity ratio between 0.0 and 1.0.
+    """
+    sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+    ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
+    
+    # Extract answer from content if it has think/answer tags
+    content_matches = re.findall(r'<answer>(.*?)</answer>', content, re.DOTALL)
+    student_answer = content_matches[-1].strip() if content_matches else content.strip()
+
+    # Clean the content and solution text
+    clean_content = clean_text(student_answer)
+    clean_sol = clean_text(ground_truth)
+
+    # Calculate the ratio of similarity
+    return ratio(clean_content, clean_sol)
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     contents = [completion[0]["content"] for completion in completions]
@@ -857,6 +884,8 @@ def accuracy_reward(completions, solution, **kwargs):
             reward = odLength_reward(content, sol)
         elif accu_reward_method == 'all_match':
             reward = all_match_reward(content, sol)
+        elif accu_reward_method == 'ratio':
+            reward = ratio_reward(content, sol)
         else:
             reward = default_accuracy_reward(content, sol)  
         rewards.append(reward)
@@ -922,7 +951,8 @@ def get_vlm_module(model_name_or_path):
     elif "internvl" in model_name_or_path.lower():
         return InvernVLModule
     else:
-        raise ValueError(f"Unsupported model: {model_name_or_path}")
+        warnings.warn(f"Model {model_name_or_path} is not recognized. Using default VLM module.")
+        return Qwen2VLModule
 
 def main(script_args, training_args, model_args):
     # Load the VLM module
@@ -935,7 +965,9 @@ def main(script_args, training_args, model_args):
         reward_funcs = [vlm_module_cls.select_reward_func(func, script_args.task_type) for func in script_args.reward_funcs]
     else:
         reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-    print("reward_funcs:", reward_funcs)
+
+    for func in reward_funcs:
+        print(f"Using reward function: {func.__name__}")
 
     # Load the JSONL datasets
     import json
@@ -943,17 +975,14 @@ def main(script_args, training_args, model_args):
     
     data_files = script_args.data_file_paths.split(":")
     image_folders = script_args.image_folders.split(":")
-    
-    if len(data_files) != len(image_folders):
-        raise ValueError("Number of data files must match number of image folders")
-    
+
     if script_args.reward_method is None:
         accu_reward_methods = ["default"] * len(data_files)
     else:
         accu_reward_methods = script_args.reward_method.split(":")
+        print(f"Using reward methods: {accu_reward_methods}")
         assert len(accu_reward_methods) == len(data_files), f"Number of reward methods must match number of data files: {len(accu_reward_methods)} != {len(data_files)}"
 
-    
     if len(data_files) != len(image_folders):
         raise ValueError("Number of data files must match number of image folders")
     

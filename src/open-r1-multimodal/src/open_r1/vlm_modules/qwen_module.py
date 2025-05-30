@@ -2,6 +2,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLForCondition
 from typing import Dict, Any, Union
 from trl.data_utils import maybe_apply_chat_template
 import torch
+import warnings
 
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
 
@@ -15,10 +16,11 @@ class Qwen2VLModule(VLMBaseModule):
     def get_model_class(self, model_id: str, model_init_kwargs: dict):
         if "Qwen2-VL" in model_id:
             model_cls = Qwen2VLForConditionalGeneration
-        elif "Qwen2.5-VL" in model_id:
+        elif "Qwen2.5-VL" in model_id or "qwen2_5_vl" in model_id:
             model_cls = Qwen2_5_VLForConditionalGeneration
         else:
-            raise ValueError(f"Unsupported model: {model_id}")
+            warnings.warn(f"Model ID {model_id} does not match Qwen2-VL or Qwen2.5-VL. Defaulting to Qwen2_5_VLForConditionalGeneration.")
+            model_cls = Qwen2_5_VLForConditionalGeneration
         return model_cls
     
     def post_model_init(self, model, processing_class):
