@@ -850,6 +850,29 @@ def ratio_reward(content, sol, **kwargs):
     # Calculate the ratio of similarity
     return ratio(clean_content, clean_sol)
 
+
+def custom_reward(content, sol, **kwargs):
+    sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+    ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
+
+    # Extract answer from content if it has think/answer tags
+    content_matches = re.findall(r'<answer>(.*?)</answer>', content, re.DOTALL)
+    student_answer = content_matches[-1].strip() if content_matches else content.strip()
+
+    # Clean the content and solution text
+    clean_student_answer = clean_text(student_answer)
+    clean_ground_truth = clean_text(ground_truth)
+
+    if len(clean_ground_truth) < 10: # if the solution is too short, use exact matching
+        return 1.0 if clean_student_answer == clean_ground_truth else 0.5 if clean_ground_truth in clean_student_answer else 0.0
+    else:
+        # Use levenshtein distance for longer solutions
+        lev = ratio(clean_student_answer, clean_ground_truth)
+        if clean_student_answer == clean_ground_truth:
+            lev += 0.1
+        return min(1.0, lev)  # Ensure a max reward of 1.0
+
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     contents = [completion[0]["content"] for completion in completions]
@@ -886,6 +909,8 @@ def accuracy_reward(completions, solution, **kwargs):
             reward = all_match_reward(content, sol)
         elif accu_reward_method == 'ratio':
             reward = ratio_reward(content, sol)
+        elif accu_reward_method == 'custom':
+            reward = custom_reward(content, sol)
         else:
             reward = default_accuracy_reward(content, sol)  
         rewards.append(reward)
@@ -895,6 +920,9 @@ def accuracy_reward(completions, solution, **kwargs):
             current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
             image_path = kwargs.get("image_path")[0] if "image_path" in kwargs else None
             problem = kwargs.get("problem")[0]
+            if reward is None:
+                print(f"Warning: Reward function {accu_reward_method} returned None for content: {content}")
+                reward = 0.0  # Set a default value if None is returned
             if reward <= 1.0:  # this condition can be changed for debug
                 with open(log_path, "a", encoding='utf-8') as f:
                     f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
@@ -902,9 +930,8 @@ def accuracy_reward(completions, solution, **kwargs):
                     f.write(f"image_path: {image_path}\n")
                     f.write(f"problem: {problem}\n")
                     f.write(f"Content: {content}\n")
-                    f.write(f"Solution: {sol}\n")     
+                    f.write(f"Solution: {sol}\n")
 
-        
     return rewards
 
 
@@ -955,6 +982,10 @@ def get_vlm_module(model_name_or_path):
         return Qwen2VLModule
 
 def main(script_args, training_args, model_args):
+    print("Training using the following arguments:")
+    print("Script Arguments:", script_args)
+    print("Training Arguments:", training_args)
+    print("Model Arguments:", model_args)
     # Load the VLM module
     vlm_module_cls = get_vlm_module(model_args.model_name_or_path)
     print("using vlm module:", vlm_module_cls.__name__)
