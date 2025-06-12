@@ -322,10 +322,10 @@ class VLMGRPOTrainer(Trainer):
         if processing_class is None:
             processing_cls = self.vlm_module.get_processing_class()
             try:
-                processing_class = processing_cls.from_pretrained(model_id, trust_remote_code=model_init_kwargs.get("trust_remote_code", None))
+                processing_class = processing_cls.from_pretrained(model_id, trust_remote_code=model_init_kwargs.get("trust_remote_code", None), use_fast=True)
             except Exception as e:
                 if "preprocessor_config.json" in str(e):
-                    processing_class = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", trust_remote_code=model_init_kwargs.get("trust_remote_code", None))
+                    processing_class = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", trust_remote_code=model_init_kwargs.get("trust_remote_code", None), use_fast=True)
             for component, processing_keyword in self.vlm_module.get_custom_processing_keywords():
                 if processing_keyword in kwargs:
                     # If we cannot find component in processing_class, return the processing_class itself
@@ -677,10 +677,16 @@ class VLMGRPOTrainer(Trainer):
 
         # Gather rewards across processes
         rewards_per_func = self.accelerator.gather(rewards_per_func)
-        
-        # Sum the rewards from all reward functions
-        rewards = rewards_per_func.sum(dim=1)
-        
+
+        # Provide weighted rewards so the reward is between 0 and 1 if the reward functions are format and accuracy
+        if len(self.reward_funcs) == 2:
+            # If we have two reward functions, we assume they are format and accuracy
+            # and we provide weighted rewards so the final reward is between 0 and 1
+            rewards = rewards_per_func[:, 0] * 0.3 + rewards_per_func[:, 1] * 0.7
+        else:
+            # Sum the rewards from all reward functions
+            rewards = rewards_per_func.sum(dim=1)
+
         # Compute grouped-wise rewards
         # Each group consists of num_generations completions for the same prompt
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
