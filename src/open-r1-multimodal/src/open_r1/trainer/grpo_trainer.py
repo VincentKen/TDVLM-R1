@@ -678,14 +678,14 @@ class VLMGRPOTrainer(Trainer):
         # Gather rewards across processes
         rewards_per_func = self.accelerator.gather(rewards_per_func)
 
-        # Provide weighted rewards so the reward is between 0 and 1 if the reward functions are format and accuracy
-        if len(self.reward_funcs) == 2:
-            # If we have two reward functions, we assume they are format and accuracy
-            # and we provide weighted rewards so the final reward is between 0 and 1
-            rewards = rewards_per_func[:, 0] * 0.3 + rewards_per_func[:, 1] * 0.7
-        else:
+        # # Provide weighted rewards so the reward is between 0 and 1 if the reward functions are format and accuracy
+        # if len(self.reward_funcs) == 2:
+        #     # If we have two reward functions, we assume they are format and accuracy
+        #     # and we provide weighted rewards so the final reward is between 0 and 1
+        #     rewards = rewards_per_func[:, 0] * 0.3 + rewards_per_func[:, 1] * 0.7
+        # else:
             # Sum the rewards from all reward functions
-            rewards = rewards_per_func.sum(dim=1)
+        rewards = rewards_per_func.sum(dim=1)
 
         # Compute grouped-wise rewards
         # Each group consists of num_generations completions for the same prompt
