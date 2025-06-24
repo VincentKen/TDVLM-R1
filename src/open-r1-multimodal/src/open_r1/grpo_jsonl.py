@@ -39,8 +39,19 @@ from open_r1.vlm_modules import *
 from typing import Tuple
 from transformers.utils import logging
 from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification
+
+from reward_models.qwen_reward_model import QwenReasoningRewardModel
+
+import torch
+from torch.nn import functional as F
+
+from peft import PeftModel
+
+from datetime import datetime
 
 import warnings
+import time
 
 from openai import OpenAI
 
@@ -55,13 +66,21 @@ from open_r1.qwen2_5vl_monkey_patch import monkey_patch_qwen2_5vl_flash_attn, mo
 monkey_patch_qwen2_5vl_flash_attn()    
 monkey_patch_torch_load()
 
-tokenizer = None
+global_trainer = None
 
+tokenizer = None
 def initialize_tokenizer(model_path):
     global tokenizer
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
     return tokenizer
+
+reasoning_reward_model = None
+def initialize_reasoning_reward_model(model_path="Qwen/Qwen2-7B-Instruct"):
+    global reasoning_reward_model
+    if reasoning_reward_model is None:
+        reasoning_reward_model = QwenReasoningRewardModel(model_path)
+    return reasoning_reward_model
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -113,6 +132,10 @@ class GRPOScriptArguments(ScriptArguments):
     is_reward_customized_from_vlm_module: bool = field(
         default=False,
         metadata={"help": "Whether to use a customized reward from vlm module"},
+    )
+    reasoning_reward_model: Optional[str] = field(
+        default="Qwen/Qwen2-7B-Instruct",
+        metadata={"help": "Path to the reasoning reward model"},
     )
 
 def extract_choice(text):
@@ -707,8 +730,6 @@ def repetition_rewards(completions, solution, **kwargs):
                     f.write(f"Content: {content}\n")
                     f.write(f"Solution: {sol}\n")     
 
-
-
     return rewards
 
 
@@ -825,6 +846,40 @@ def default_accuracy_reward(content, sol, **kwargs):
 
     return reward
 
+def extract_reasoning_and_answer(content):
+    """
+    Extract reasoning and final answer from the content.
+    
+    Args:
+        content (str): The generated content from the model.
+        
+    Returns:
+        tuple: (reasoning, final_answer)
+    """
+    reasoning = ""
+    final_answer = ""
+
+    # Extract reasoning if it exists
+    reasoning_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
+    if reasoning_match:
+        reasoning = reasoning_match.group(1).strip()
+
+    # Extract final answer
+    clean_student_answer = clean_text(content)
+    if "<answer>" in clean_student_answer and not "</answer>" in clean_student_answer:
+        # Just use everything after the last <answer> tag if it is not closed
+        clean_student_answer = clean_student_answer.split("<answer>")[-1].strip()
+    elif "<answer>" not in clean_student_answer and "</think>" in clean_student_answer:
+        # If there is no <answer> tag, but there is a </think> tag, use everything before it
+        clean_student_answer = clean_student_answer.split("</think>")[-1].strip()
+    else:
+        content_matches = re.findall(r'<answer>(.*?)</answer>', content, re.DOTALL)
+        student_answer = content_matches[-1].strip() if content_matches else content.strip()
+        clean_student_answer = clean_text(student_answer)
+
+    final_answer = clean_student_answer
+    return reasoning, final_answer
+
 def ratio_reward(content, sol, **kwargs):
     """
     Calculate the reward based on the similarity ratio between content and solution.
@@ -850,7 +905,6 @@ def ratio_reward(content, sol, **kwargs):
     # Calculate the ratio of similarity
     return ratio(clean_content, clean_sol)
 
-
 def custom_reward(content, sol, **kwargs):
     sol_match = re.search(r'<answer>(.*?)</answer>', sol)
     ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
@@ -873,11 +927,123 @@ def custom_reward(content, sol, **kwargs):
         return min(1.0, lev)  # Ensure a max reward of 1.0
 
 
+def semscore_reward(student_answer, ground_truth, **kwargs):
+    """
+    Calculate the semantic similarity score between the content and solution using method outlined here:
+    https://huggingface.co/blog/g-ronimo/semscore
+    """
+    global tokenizer
+    global global_trainer
+
+    encoded_student_answer = tokenizer(student_answer, padding=True, truncation=True, return_tensors='pt')
+    encoded_ground_truth = tokenizer(ground_truth, padding=True, truncation=True, return_tensors='pt')
+
+    for k in encoded_student_answer:
+        if isinstance(encoded_student_answer[k], torch.Tensor):
+            encoded_student_answer[k] = encoded_student_answer[k].to(global_trainer.model.device)
+    for k in encoded_ground_truth:
+        if isinstance(encoded_ground_truth[k], torch.Tensor):
+            encoded_ground_truth[k] = encoded_ground_truth[k].to(global_trainer.model.device)
+
+    with torch.no_grad():
+        student_embedding = global_trainer.model(
+            input_ids=encoded_student_answer["input_ids"],
+            attention_mask=encoded_student_answer["attention_mask"],
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        ground_truth_embedding = global_trainer.model(
+            input_ids=encoded_ground_truth["input_ids"],
+            attention_mask=encoded_ground_truth["attention_mask"],
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+    def mean_pooling(output, mask):
+        tok_emb = output.hidden_states[-1]  # Use the last hidden state
+        expanded_mask = mask.unsqueeze(-1).expand(tok_emb.size()).float()
+        return (tok_emb * expanded_mask).sum(1) / torch.clamp(expanded_mask.sum(1), min=1e-9)
+    
+    student_embedding = mean_pooling(student_embedding, encoded_student_answer['attention_mask'])
+    ground_truth_embedding = mean_pooling(ground_truth_embedding, encoded_ground_truth['attention_mask'])
+
+    student_embedding = F.normalize(student_embedding, p=2, dim=1)
+    ground_truth_embedding = F.normalize(ground_truth_embedding, p=2, dim=1)
+
+    def cosine_similarity(a, b):
+        return (a * b).sum(dim=1)
+
+    return cosine_similarity(student_embedding, ground_truth_embedding).item()
+
+def reasoning_reward(problem, student_answer, ground_truth, **kwargs):
+    """
+    Calculate the reward for Qwen2 model based on the content and solution.
+    
+    Args:
+        content (str): The generated content from the model.
+        sol (str): The ground truth solution.
+        
+    Returns:
+        float: Reward score between 0.0 and 1.0.
+        str: Reasoning text explaining the score.
+        bool: Whether the reasoning model failed and fallback to semantic similarity reward.
+    """
+    global reasoning_reward_model
+
+    if "<thinking>" in student_answer or "<think>" in student_answer:
+        # Formatting is wrong, which means we can not extract an answer
+        return 0.0, "Formatting error: No valid answer found in the content.", True 
+
+    # First try ratio. This is fast and if it indicates an almost perfect match, we can skip the slow reasoning model.
+    ratio_score = ratio(student_answer, ground_truth)
+
+    if ratio_score > 0.9:
+        return ratio_score, None, False
+
+    if ground_truth.startswith("only the signal") and student_answer in ground_truth:
+        # Special case where reasoning sometimes fails
+        return 1.0, None, False
+
+    reward, reasoning = reasoning_reward_model(problem, student_answer, ground_truth)
+    if reward is None and "..." in reasoning:
+        # reasoning model got a bit stuck, give it one more chance
+        reward, reasoning = reasoning_reward_model(problem, student_answer, ground_truth)
+    if reward is None:
+        # If the reasoning model fails, fallback to semantic similarity reward
+        return semscore_reward(student_answer, ground_truth), reasoning, True
+
+    return reward, reasoning, False
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
+    # SOL is ground_truth solution, COM is the model's generated content
     contents = [completion[0]["content"] for completion in completions]
+
     rewards = []
-    for content, sol, accu_reward_method in zip(contents, solution, kwargs.get("accu_reward_method")):
+    for content, sol, accu_reward_method, problem in zip(contents, solution, kwargs.get("accu_reward_method"), kwargs.get("problem")):
+        sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+        ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
+
+        # Extract answer from content if it has think/answer tags
+        content_matches = re.findall(r'<answer>(.*?)</answer>', content, re.DOTALL)
+        student_answer = content_matches[-1].strip() if content_matches else content.strip()
+
+        # Clean the content and solution text
+        clean_student_answer = clean_text(student_answer)
+        if "<answer>" in clean_student_answer and not "</answer>" in clean_student_answer:
+            # Just use everything after the last <answer> tag if it is not closed
+            clean_student_answer = clean_student_answer.split("<answer>")[-1].strip()
+        clean_ground_truth = clean_text(ground_truth)
+        if clean_ground_truth == "none" or clean_ground_truth == None:
+            clean_ground_truth = sol.strip()  # Fallback to original solution if cleaned version is empty
+
+        # Sometimes there are still <answer> tags in the ground truth, simply remove them
+        clean_ground_truth = clean_ground_truth.replace("<answer>", "").replace("</answer>", "").strip()
+
+        reasoning = None
+        failed = False
+        time_taken = 0.0
+        t = time.time()
         # if accu_reward_method is defined, use the corresponding reward function, otherwise use the default reward function
         if accu_reward_method == "mcq":
             reward = mcq_reward(content, sol)
@@ -911,26 +1077,37 @@ def accuracy_reward(completions, solution, **kwargs):
             reward = ratio_reward(content, sol)
         elif accu_reward_method == 'custom':
             reward = custom_reward(content, sol)
+        elif accu_reward_method == 'semscore':
+            reward = semscore_reward(clean_student_answer, clean_ground_truth)
+        elif accu_reward_method == 'reasoning':
+            reward, reasoning, failed = reasoning_reward(problem, clean_student_answer, clean_ground_truth)
         else:
-            reward = default_accuracy_reward(content, sol)  
+            reward = default_accuracy_reward(content, sol)
+
+        time_taken = time.time() - t
         rewards.append(reward)
-        
+
         if os.getenv("DEBUG_MODE") == "true":
             log_path = os.getenv("LOG_PATH")
             current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
             image_path = kwargs.get("image_path")[0] if "image_path" in kwargs else None
-            problem = kwargs.get("problem")[0]
             if reward is None:
                 print(f"Warning: Reward function {accu_reward_method} returned None for content: {content}")
                 reward = 0.0  # Set a default value if None is returned
             if reward <= 1.0:  # this condition can be changed for debug
                 with open(log_path, "a", encoding='utf-8') as f:
-                    f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+                    f.write(f"------------- {current_time} Accuracy reward ({time_taken}): {reward} -------------\n")
                     f.write(f"accu_reward_method: {accu_reward_method}\n")
+                    if reasoning is not None:
+                        if failed:
+                            f.write("Reasoning model failed, fallback to semantic similarity reward\n")
+                        f.write(f"Reasoning for reward: {reasoning}\n")
                     f.write(f"image_path: {image_path}\n")
-                    f.write(f"problem: {problem}\n")
+                    f.write(f"Problem: {problem}\n")
                     f.write(f"Content: {content}\n")
-                    f.write(f"Solution: {sol}\n")
+                    f.write(f"Student Answer: {clean_student_answer}\n")
+                    f.write(f"Ground Truth: {clean_ground_truth}\n")
+                    f.write("---------------------------------------------------\n")
 
     return rewards
 
@@ -982,6 +1159,8 @@ def get_vlm_module(model_name_or_path):
         return Qwen2VLModule
 
 def main(script_args, training_args, model_args):
+    global global_trainer
+    global reasoning_reward_model
     print("Training using the following arguments:")
     print("Script Arguments:", script_args)
     print("Training Arguments:", training_args)
@@ -991,7 +1170,11 @@ def main(script_args, training_args, model_args):
     print("using vlm module:", vlm_module_cls.__name__)
     question_prompt = vlm_module_cls.get_question_template(task_type=script_args.task_type)
 
-    # Get reward functions 
+    # Initialize the reward model if needed
+    if script_args.reward_method == "reasoning":
+        initialize_reasoning_reward_model(script_args.reasoning_reward_model)
+
+    # Get reward functions
     if script_args.is_reward_customized_from_vlm_module:
         reward_funcs = [vlm_module_cls.select_reward_func(func, script_args.task_type) for func in script_args.reward_funcs]
     else:
@@ -1097,7 +1280,7 @@ def main(script_args, training_args, model_args):
     print("using trainer:", trainer_cls.__name__)
     initialize_tokenizer(model_args.model_name_or_path)
     # Initialize the GRPO trainer
-    trainer = trainer_cls(
+    global_trainer = trainer_cls(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
@@ -1114,14 +1297,14 @@ def main(script_args, training_args, model_args):
 
     # Train and push the model to the Hub
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+        global_trainer.train(resume_from_checkpoint=True)
     else:
-        trainer.train()
+        global_trainer.train()
 
     # Save and push to hub
-    trainer.save_model(training_args.output_dir)
+    global_trainer.save_model(training_args.output_dir)
     if training_args.push_to_hub:
-        trainer.push_to_hub()
+        global_trainer.push_to_hub()
 
 
 if __name__ == "__main__":
